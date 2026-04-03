@@ -1,0 +1,139 @@
+---
+title: "SPH5104_Analysis"
+author: "Hao, Sicheng"
+date: "2026-03-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(tidyr)
+library(tidyverse)
+library(readxl)
+library(gdata)
+library(lubridate)
+library(comorbidity)
+library(table1)
+library(bigrquery)
+library(DBI)
+library(dbplyr)
+library(dplyr)
+library(broom)
+library(patchwork)
+library(writexl)
+
+project_id <- "mimic-hr"
+
+bq_auth()
+
+mimic_iv_sql <- "
+select * from `mimic-hr.derived.cancer_cohort_mv` 
+"
+mimic_iv_job <- bq_project_query(
+  x = project_id,
+  query = mimic_iv_sql,
+  use_legacy_sql = FALSE
+)
+
+cohort <- bq_table_download(mimic_iv_job)
+```
+
+
+### Download Additional Data
+```{r}
+
+mimic_iv_sql <- "
+select * from `mimic-hr.hourly.icu_hourly`  
+where stay_id in (select stay_id from `mimic-hr.derived.cancer_cohort_mv` )
+"
+mimic_iv_job <- bq_project_query(
+  x = project_id,
+  query = mimic_iv_sql,
+  use_legacy_sql = FALSE
+)
+
+hourly_data <- bq_table_download(mimic_iv_job)
+
+mimic_iv_sql <- "
+select * from `mimic-hr.hourly.icu_hourly`  
+where stay_id in (select stay_id from `mimic-hr.derived.cancer_cohort_mv` )
+"
+mimic_iv_job <- bq_project_query(
+  x = project_id,
+  query = mimic_iv_sql,
+  use_legacy_sql = FALSE
+)
+
+
+
+# 2. DEMOGRAPHICS (admissions + age + gender)
+
+sql <- "
+SELECT subject_id, hadm_id, insurance, language, race, marital_status, hospital_expire_flag
+FROM `physionet-data.mimiciv_3_1_hosp.admissions`
+"
+bq_data <- bq_project_query(project_id, query = sql)
+mimic_demographic = bq_table_download(bq_data)
+
+sql <- "SELECT hadm_id, age FROM `physionet-data.mimiciv_3_1_derived.age`"
+bq_data <- bq_project_query(project_id, query = sql)
+mimic_age = bq_table_download(bq_data)
+
+sql <- "SELECT subject_id, gender FROM `physionet-data.mimiciv_3_1_hosp.patients`"
+bq_data <- bq_project_query(project_id, query = sql)
+mimic_gender = bq_table_download(bq_data)
+
+
+# 3. ICU STAYS — identify first ICU stay per patient
+
+sql <- "
+select icu.* ,adm.admission_location,adm.discharge_location,hospital_expire_flag,gender,insurance,pt.dod,
+ROW_NUMBER() OVER (PARTITION BY icu.hadm_id ORDER BY icu.intime) AS row_number
+from `physionet-data.mimiciv_3_1_icu.icustays` icu
+left join `physionet-data.mimiciv_3_1_hosp.admissions` adm
+on adm.hadm_id = icu.hadm_id
+and adm.subject_id = icu.subject_id
+left join `physionet-data.mimiciv_3_1_hosp.patients` pt
+on adm.subject_id = pt.subject_id
+"
+bq_data <- bq_project_query(project_id, query = sql)
+all_icus = bq_table_download(bq_data)
+nrow(all_icus)
+
+first_icu = all_icus%>%filter(row_number==1)
+first_icu = first_icu%>%
+  group_by(subject_id)%>%
+  arrange(intime)%>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+mimic_demographic = left_join(mimic_demographic,mimic_age)
+mimic_demographic = left_join(mimic_demographic,mimic_gender)
+
+
+# 4. ICU-SPECIFIC MORTALITY (death within 6h of ICU discharge)
+
+sql <- "
+SELECT icu.*,adm.deathtime
+, CASE when adm.deathtime <= icu.outtime + interval 6 hour then 1 else 0 end as icu_death_flag
+FROM `physionet-data.mimiciv_3_1_icu.icustays` icu
+LEFT JOIN `physionet-data.mimiciv_3_1_hosp.admissions` adm
+ON icu.hadm_id = adm.hadm_id
+"
+bq_data <- bq_project_query(project_id, query = sql)
+mimic_icu = bq_table_download(bq_data)
+
+mimic_icu = left_join(mimic_icu,mimic_demographic)
+mimic_first_icu = mimic_icu%>%filter(stay_id%in%first_icu$stay_id)
+
+```
+
+```{r}
+
+
+```
+
+
+
+```{r}
