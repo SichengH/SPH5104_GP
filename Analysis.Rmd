@@ -67,7 +67,6 @@ mimic_iv_job <- bq_project_query(
 )
 
 
-
 # 2. DEMOGRAPHICS (admissions + age + gender)
 
 sql <- "
@@ -128,13 +127,168 @@ mimic_icu = bq_table_download(bq_data)
 mimic_icu = left_join(mimic_icu,mimic_demographic)
 mimic_first_icu = mimic_icu%>%filter(stay_id%in%first_icu$stay_id)
 
+
+# 5. Cancer patients
+
+sql <- "
+select * from `mimic-hr.derived.pivoted_cancer` 
+"
+bq_data <- bq_project_query(project_id, query = sql)
+mimic_cancer = bq_table_download(bq_data)
+
+mimic_cancer = mimic_cancer%>%filter(has_cancer == 1)
+
+first_icu_cancer = left_join(mimic_cancer,mimic_first_icu)
+first_icu_cancer = first_icu_cancer%>%filter(!is.na(stay_id))
+
+
+# 6. Cancer patients
+
+sql <- "
+select * from `mimic-hr.derived.pivoted_cancer` 
+"
+bq_data <- bq_project_query(project_id, query = sql)
+mimic_cancer = bq_table_download(bq_data)
+
+mimic_cancer = mimic_cancer%>%filter(has_cancer == 1)
+mimic_cancer_cohort = mimic_first_icu%>%filter(hadm_id%in%mimic_cancer$hadm_id)
 ```
 
-```{r}
+### Adding Covariates
+```{r,echo = F}
+sql <- "SELECT * FROM `mimic-hr.derived.sofa2`"
+bq_data <- bq_project_query(project_id, query = sql)
+sofa2_mimic = bq_table_download(bq_data)
+
+sofa2_cohort = sofa2_mimic%>%
+  filter(stay_id%in%mimic_cancer_cohort$stay_id)%>%
+  filter(hr < 48)
+
+### DNI
+sql <- "
+SELECT stay_id, value,itemid,charttime
+FROM `physionet-data.mimiciv_3_1_icu.chartevents`
+WHERE (value LIKE '%DNI (do not intubate)%' AND itemid = 223758) 
+OR (value LIKE '%DNR / DNI%' AND itemid = 223758) 
+OR (value LIKE 'Comfort measures only' AND itemid = 223758)
+OR (value LIKE '%DNI (do not intubate)%' AND itemid = 228687) 
+OR (value LIKE '%DNAR (Do Not Attempt Resuscitation) [DNR] / DNI%' AND itemid = 228687)
+OR (value LIKE 'Comfort measures only' AND itemid = 228687)
+"
+bq_data <- bq_project_query(project_id, query = sql)
+dni = bq_table_download(bq_data)
 
 
+sql <- "SELECT * FROM `mimic-hr.derived.bg` "
+bq_data <- bq_project_query(project_id, query = sql)
+blood_gas = bq_table_download(bq_data)
+blood_gas = blood_gas%>%
+  filter(hadm_id%in%mimic_cancer_cohort$hadm_id)
+
+mimic_cancer_cohort = left_join(mimic_cancer_cohort,cohort)
 ```
 
 
+### Selection Criteria
 
+Already did:
+First ICU admission of all patients,n = 65366
+Cancer patient's first ICU admission, n = 5270
 ```{r}
+### Inclusion, need oxygenation on the first day
+
+cohort <- mimic_cancer_cohort %>%
+  mutate(
+    intime = as.POSIXct(intime, tz = "UTC"),
+    starttime = as.POSIXct(starttime, tz = "UTC"),
+    deathtime = as.POSIXct(deathtime, tz = "UTC"),
+    time_diff_hours = as.numeric(difftime(starttime, intime, units = "hours")),
+    `28-day mortality` = if_else(
+      !is.na(deathtime) &
+        as.numeric(difftime(deathtime, intime, units = "days")) >= 0 &
+        as.numeric(difftime(deathtime, intime, units = "days")) <= 28,
+      1L, 0L
+    )
+  )
+
+### Exclude arrive at ICU ventilated 1 hours before arrive
+cohort = cohort%>%filter(time_diff_hours>-1&time_diff_hours<12)### 1512 ### Define require ventilated patient as immediately ventilated and ventilated slightly before ICU admission and also ventilated very soon. 
+
+hist(cohort$time_diff_hours)
+
+```
+
+### Add Covariests
+
+```{r,echo = FALSE}
+## Create binary ventilation label:
+## 0 = HFNC/NonInvasiveVent, 1 = Tracheostomy/InvasiveVent; remove None
+resp_support_col <- intersect(
+  c("ventilation_status", "ventilation_type", "oxygenation_type", "resp_support_type"),
+  names(cohort)
+)[1]
+
+if (!is.na(resp_support_col)) {
+  cohort <- cohort %>%
+    mutate(
+      vent_label = case_when(
+        .data[[resp_support_col]] %in% c("HFNC", "NonInvasiveVent") ~ 0L,
+        .data[[resp_support_col]] %in% c("Tracheostomy", "InvasiveVent") ~ 1L,
+        TRUE ~ NA_integer_
+      )
+    ) %>%
+    filter(.data[[resp_support_col]] != "None") %>%
+    filter(!is.na(vent_label))
+}
+
+## Add SOFA-related covariates from first 6 ICU hours (max value, ignore NA)
+sofa_vars <- c(
+  "rate_epinephrine", "rate_norepinephrine", "rate_dopamine",
+  "rate_dobutamine", "rate_milrinone", "rate_vasopressin",
+  "rate_phenylephrine", "meanbp_min", "gcs_min", "gcs_motor_min",
+   "uomlkghr_6hr", "bilirubin_max",
+  "creatinine_max", "platelet_min", "dialysis_present", "dialysis_active",
+  "ph", "bicarbonate", "potassium", "delirium_drug_rate", "respiration",
+  "coagulation", "liver", "cardiovascular", "cns", "renal"
+)
+
+available_sofa_vars <- intersect(sofa_vars, names(sofa2_cohort))
+
+agg_by_name <- function(x, var_name) {
+  if (all(is.na(x))) return(NA_real_)
+  if (grepl("min", var_name, ignore.case = TRUE)) {
+    return(min(x, na.rm = TRUE))
+  }
+  return(max(x, na.rm = TRUE))
+}
+
+sofa6_max <- sofa2_cohort %>%
+  filter(hr <= 6) %>%
+  group_by(stay_id) %>%
+  summarise(
+    across(
+      all_of(available_sofa_vars),
+      ~ agg_by_name(.x, cur_column())
+    ),
+    .groups = "drop"
+  )
+
+n_cohort_before_join <- nrow(cohort)
+cohort <- cohort %>% left_join(sofa6_max, by = "stay_id")
+stopifnot(nrow(cohort) == n_cohort_before_join)
+
+## Rename SOFA component variables and replace NA with 0
+sofa_component_vars <- c(
+  "respiration", "coagulation", "liver", "cardiovascular", "cns", "renal"
+)
+sofa_component_vars <- intersect(sofa_component_vars, names(cohort))
+
+if (length(sofa_component_vars) > 0) {
+  cohort <- cohort %>%
+    rename_with(~ paste0("SOFA_", .x), all_of(sofa_component_vars)) %>%
+    mutate(across(all_of(paste0("SOFA_", sofa_component_vars)), ~ replace_na(.x, 0)))
+}
+
+
+
+```
