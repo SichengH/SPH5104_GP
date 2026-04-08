@@ -212,7 +212,7 @@ cohort <- mimic_cancer_cohort %>%
   )
 
 ### Exclude arrive at ICU ventilated 1 hours before arrive
-cohort = cohort%>%filter(time_diff_hours>-1&time_diff_hours<12)### 1512 ### Define require ventilated patient as immediately ventilated and ventilated slightly before ICU admission and also ventilated very soon. 
+cohort = cohort%>%filter(time_diff_hours>-1&time_diff_hours<24)### 1512 ### Define require ventilated patient as immediately ventilated and ventilated slightly before ICU admission and also ventilated very soon. 
 
 hist(cohort$time_diff_hours)
 
@@ -249,7 +249,7 @@ sofa_vars <- c(
    "uomlkghr_6hr", "bilirubin_max",
   "creatinine_max", "platelet_min", "dialysis_present", "dialysis_active",
   "ph", "bicarbonate", "potassium", "delirium_drug_rate", "respiration",
-  "coagulation", "liver", "cardiovascular", "cns", "renal"
+  "coagulation", "liver", "cardiovascular", "cns", "renal","sofa_24hours"
 )
 
 available_sofa_vars <- intersect(sofa_vars, names(sofa2_cohort))
@@ -289,6 +289,6 @@ if (length(sofa_component_vars) > 0) {
     mutate(across(all_of(paste0("SOFA_", sofa_component_vars)), ~ replace_na(.x, 0)))
 }
 
-
+fwrite(cohort, file = "sph5104gp.csv")
 
 ```
