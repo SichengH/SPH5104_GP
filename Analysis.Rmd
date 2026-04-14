@@ -22,6 +22,8 @@ library(dplyr)
 library(broom)
 library(patchwork)
 library(writexl)
+
+library(MatchIt)
 ##
 
 project_id <- "mimic-hr"
@@ -37,7 +39,7 @@ mimic_iv_job <- bq_project_query(
   use_legacy_sql = FALSE
 )
 
-cohort <- bq_table_download(mimic_iv_job)
+cancer_cohort <- bq_table_download(mimic_iv_job)
 ```
 
 
@@ -127,7 +129,6 @@ mimic_icu = bq_table_download(bq_data)
 mimic_icu = left_join(mimic_icu,mimic_demographic)
 mimic_first_icu = mimic_icu%>%filter(stay_id%in%first_icu$stay_id)
 
-
 # 5. Cancer patients
 
 sql <- "
@@ -140,7 +141,6 @@ mimic_cancer = mimic_cancer%>%filter(has_cancer == 1)
 
 first_icu_cancer = left_join(mimic_cancer,mimic_first_icu)
 first_icu_cancer = first_icu_cancer%>%filter(!is.na(stay_id))
-
 
 # 6. Cancer patients
 
@@ -203,10 +203,11 @@ cohort <- mimic_cancer_cohort %>%
     starttime = as.POSIXct(starttime, tz = "UTC"),
     deathtime = as.POSIXct(deathtime, tz = "UTC"),
     time_diff_hours = as.numeric(difftime(starttime, intime, units = "hours")),
+    death_days_from_intime = as.numeric(difftime(deathtime, intime, units = "days")),
     `28-day mortality` = if_else(
       !is.na(deathtime) &
-        as.numeric(difftime(deathtime, intime, units = "days")) >= 0 &
-        as.numeric(difftime(deathtime, intime, units = "days")) <= 28,
+        death_days_from_intime >= 0 &
+        death_days_from_intime <= 28,
       1L, 0L
     )
   )
@@ -214,19 +215,17 @@ cohort <- mimic_cancer_cohort %>%
 ### Exclude arrive at ICU ventilated 1 hours before arrive
 cohort = cohort%>%filter(time_diff_hours>-1&time_diff_hours<24)### 1512 ### Define require ventilated patient as immediately ventilated and ventilated slightly before ICU admission and also ventilated very soon. 
 
-hist(cohort$time_diff_hours)
-
+cohort = left_join(cohort,mimic_cancer%>%select(hadm_id,group_solid,group_hematological,group_metastasized))
 ```
 
 ### Add Covariests
 
+
+### SOFA related
 ```{r,echo = FALSE}
 ## Create binary ventilation label:
 ## 0 = HFNC/NonInvasiveVent, 1 = Tracheostomy/InvasiveVent; remove None
-resp_support_col <- intersect(
-  c("ventilation_status", "ventilation_type", "oxygenation_type", "resp_support_type"),
-  names(cohort)
-)[1]
+resp_support_col <- c("ventilation_status")
 
 if (!is.na(resp_support_col)) {
   cohort <- cohort %>%
@@ -289,6 +288,162 @@ if (length(sofa_component_vars) > 0) {
     mutate(across(all_of(paste0("SOFA_", sofa_component_vars)), ~ replace_na(.x, 0)))
 }
 
+## Combine vasoactive infusion rates into binary pressor indicator
+pressor_vars <- c(
+  "rate_epinephrine", "rate_norepinephrine", "rate_dopamine",
+  "rate_dobutamine", "rate_milrinone", "rate_vasopressin",
+  "rate_phenylephrine"
+)
+available_pressor_vars <- intersect(pressor_vars, names(cohort))
+
+if (length(available_pressor_vars) > 0) {
+  cohort <- cohort %>%
+    mutate(
+      pressor = as.integer(
+        rowSums(!is.na(across(all_of(available_pressor_vars)))) > 0
+      )
+    )
+}
+
+
+```
+
+
+### Other
+```{r,echo = F}
+sql <- "SELECT * FROM `physionet-data.mimiciv_3_1_derived.bg` 
+where specimen = 'ART.'
+"
+bq_data <- bq_project_query(project_id, query = sql)
+blood_gas = bq_table_download(bq_data)
+
+bg_vars <- c(
+  "so2", "po2", "pco2", "fio2", "bicarbonate", "totalco2",
+  "hematocrit", "hemoglobin", "carboxyhemoglobin", "methemoglobin",
+  "chloride", "calcium", "temperature", "potassium",
+  "sodium", "lactate", "glucose"
+)
+available_bg_vars <- intersect(bg_vars, names(blood_gas))
+
+bg_join_key <- intersect(c("stay_id", "hadm_id", "subject_id"), names(blood_gas))
+bg_join_key <- bg_join_key[bg_join_key %in% names(cohort)][1]
+if (is.na(bg_join_key)) {
+  stop("No common join key between blood_gas and cohort (tried stay_id, hadm_id, subject_id).")
+}
+
+cohort_intime <- cohort %>%
+  select(stay_id, all_of(bg_join_key), intime) %>%
+  distinct() %>%
+  mutate(intime = as.POSIXct(intime, tz = "UTC"))
+
+blood_gas_last_preicu <- blood_gas %>%
+  mutate(charttime = as.POSIXct(charttime, tz = "UTC")) %>%
+  inner_join(cohort_intime, by = bg_join_key) %>%
+  filter(!is.na(charttime), !is.na(intime), charttime <= intime) %>%
+  group_by(stay_id) %>%
+  arrange(charttime) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>%
+  select(stay_id, all_of(available_bg_vars))
+
+n_cohort_before_bg_join <- nrow(cohort)
+cohort <- cohort %>%
+  left_join(blood_gas_last_preicu, by = "stay_id", suffix = c("", "_bg"))
+stopifnot(nrow(cohort) == n_cohort_before_bg_join)
+
+
+sql <- "SELECT * FROM `physionet-data.mimiciv_3_1_derived.sapsii` 
+"
+bq_data <- bq_project_query(project_id, query = sql)
+sapsii = bq_table_download(bq_data)
+
+cohort = left_join(cohort,sapsii%>%select(stay_id,sapsii))
+
+```
+
+
+
+
+```{r,echo = FALSE}
 fwrite(cohort, file = "sph5104gp.csv")
+
+```
+
+### Table 1
+```{r,echo = F}
+table1_data <- cohort %>%
+  mutate(
+    race_group = case_when(
+      str_detect(str_to_upper(coalesce(race, "")), "^WHITE") ~ "WHITE",
+      str_detect(str_to_upper(coalesce(race, "")), "^BLACK") ~ "BLACK",
+      str_detect(str_to_upper(coalesce(race, "")), "^ASIAN") ~ "ASIAN",
+      TRUE ~ "Other"
+    ),
+    language_group = case_when(
+      str_to_upper(coalesce(language, "")) == "ENGLISH" ~ "English",
+      TRUE ~ "Non-English"
+    ),
+    insurance_group = case_when(
+      str_detect(str_to_upper(coalesce(insurance, "")), "MEDICARE|MEDICAID|MEDICATE") ~ "Medicare/Medicaid",
+      str_to_upper(coalesce(insurance, "")) == "PRIVATE" ~ "Private",
+      TRUE ~ "Other"
+    ),
+    vent_label = factor(
+      vent_label,
+      levels = c(0, 1),
+      labels = c("HFNC/NonInvasiveVent", "Tracheostomy/InvasiveVent")
+    ),
+    `28-day mortality` = factor(`28-day mortality`, levels = c(0, 1), labels = c("No", "Yes")),
+    hospital_expire_flag = factor(hospital_expire_flag, levels = c(0, 1), labels = c("No", "Yes")),
+    marital_status = as.factor(marital_status),
+    dialysis_active = as.factor(dialysis_active),
+    pressor = as.factor(pressor),
+    race_group = factor(race_group, levels = c("WHITE", "BLACK", "ASIAN", "Other")),
+    language_group = factor(language_group, levels = c("English", "Non-English")),
+    insurance_group = factor(insurance_group, levels = c("Medicare/Medicaid", "Private", "Other"))
+  ) %>%
+  filter(!is.na(vent_label))
+
+vars_1a_req <- c(
+  "28-day mortality", "hospital_expire_flag", "age", "sofa_24hours", "sapsii",
+  "race_group", "language_group", "insurance_group", "marital_status"
+)
+vars_1b_req <- c(
+  "meanbp_min", "gcs_min", "bilirubin_max", "creatinine_max", "platelet_min",
+  "dialysis_active", "ph", "bicarbonate", "potassium",
+  "so2", "po2", "pco2", "fio2", "totalco2", "hematocrit", "hemoglobin",
+  "carboxyhemoglobin", "methemoglobin", "chloride", "calcium",
+  "temperature", "sodium", "lactate", "glucose", "sapsii", "pressor"
+)
+vars_1a <- intersect(vars_1a_req, names(table1_data))
+vars_1b <- intersect(vars_1b_req, names(table1_data))
+
+if (length(vars_1a) == 0) stop("No variables from table 1a were found in table1_data.")
+if (length(vars_1b) == 0) stop("No variables from table 1b were found in table1_data.")
+
+make_table1_formula <- function(vars, strata) {
+  as.formula(paste("~", paste(sprintf("`%s`", vars), collapse = " + "), "|", strata))
+}
+
+tab_1a <- table1::table1(make_table1_formula(vars_1a, "vent_label"), data = table1_data)
+tab_1b <- table1::table1(make_table1_formula(vars_1b, "vent_label"), data = table1_data)
+
+cat("Table 1a\n")
+tab_1a
+cat("\nTable 1b\n")
+tab_1b
+
+table1_to_df <- function(tab_obj) {
+  xml2::read_html(as.character(tab_obj)) %>%
+    rvest::html_element("table") %>%
+    rvest::html_table(fill = TRUE)
+}
+
+tab_1a_df <- table1_to_df(tab_1a)
+tab_1b_df <- table1_to_df(tab_1b)
+
+writexl::write_xlsx(tab_1a_df, path = "table-1a.xlsx")
+writexl::write_xlsx(tab_1b_df, path = "table-1b.xlsx")
+
 
 ```
