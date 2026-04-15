@@ -1,0 +1,637 @@
+---
+title: "Causal_Inference"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(tidyr)
+library(tidyverse)
+library(readxl)
+library(gdata)
+library(lubridate)
+library(comorbidity)
+library(table1)
+library(bigrquery)
+library(DBI)
+library(dbplyr)
+library(dplyr)
+library(broom)
+library(patchwork)
+library(writexl)
+
+library(MatchIt)
+```
+
+### Pre-processing
+
+```{r,echo=FALSE}
+
+cohort <- fread("sph5104gp.csv")
+
+
+# confounders <- c(
+#   "race", "age", "gender", "meanbp_min", "gcs_min", "gcs_motor_min",
+#   "uomlkghr_6hr", "bilirubin_max", "creatinine_max", "platelet_min",
+#   "dialysis_active", "ph", "bicarbonate", "potassium", "sofa_24hours",
+#   "so2", "po2", "pco2", "fio2", "totalco2", "hematocrit", "hemoglobin",
+#   "carboxyhemoglobin", "methemoglobin", "chloride", "calcium",
+#   "temperature", "sodium", "lactate", "glucose", "sapsii", "pressor"
+# )
+
+confounders <- c(
+  "age", "meanbp_min", "gcs_min",
+  "bilirubin_max", "creatinine_max", "platelet_min",
+  "dialysis_active", "ph", "bicarbonate", "potassium",
+  "temperature", "sodium", "glucose", "pressor"
+)
+
+required_vars <- c("vent_label_ITT","vent_label_PP","vent_label_sen", confounders, "hospital_expire_flag", "28-day mortality")
+
+data <- cohort %>% select(any_of(required_vars))
+
+
+```
+
+### Multiple Imputation
+
+```{r,echo=FALSE}
+
+impute_data <- data
+
+exclude_vars <- c("vent_label_ITT", "vent_label_PP", "vent_label_sen", "28-day mortality", "hospital_expire_flag")
+
+meth <- mice::make.method(impute_data)
+pred <- mice::make.predictorMatrix(impute_data)
+meth[] <- ""
+
+na_vars <- names(which(colSums(is.na(impute_data)) > 0))
+impute_vars <- setdiff(na_vars, exclude_vars)
+
+for (v in impute_vars) {
+  x_non_na <- impute_data[[v]][!is.na(impute_data[[v]])]
+  if (length(x_non_na) == 0 || length(unique(x_non_na)) <= 1) next
+  if (is.numeric(impute_data[[v]])) {
+    meth[v] <- "pmm"
+  } else if (is.factor(impute_data[[v]]) && nlevels(impute_data[[v]]) == 2) {
+    meth[v] <- "logreg"
+  } else if (is.factor(impute_data[[v]])) {
+    meth[v] <- "polyreg"
+  } else {
+    meth[v] <- "pmm"
+  }
+}
+
+keep_exclude <- intersect(exclude_vars, names(impute_data))
+meth[keep_exclude] <- ""
+pred[keep_exclude, ] <- 0
+pred[, keep_exclude] <- 0
+
+set.seed(5104)
+imp <- mice::mice(
+  data = impute_data,
+  m = 5,
+  maxit = 20,
+  method = meth,
+  predictorMatrix = pred,
+  ridge = 1e-03,
+  printFlag = FALSE
+)
+
+data_imputed <- mice::complete(imp, action = 1)
+exclude_front <- data %>% select(any_of(exclude_vars))
+data_imputed <- data_imputed %>% select(-any_of(exclude_vars))
+data_imputed <- bind_cols(exclude_front, data_imputed)
+```
+
+### Data Split
+```{r,echo = FALSE}
+exposures <- c("vent_label_ITT", "vent_label_PP", "vent_label_sen")
+outcomes <- c("28-day mortality", "hospital_expire_flag")
+
+required_split_cols <- unique(c(exposures, outcomes, confounders))
+missing_split_cols <- setdiff(required_split_cols, names(data_imputed))
+if (length(missing_split_cols) > 0) {
+  stop(paste("Missing columns in data_imputed:", paste(missing_split_cols, collapse = ", ")))
+}
+
+make_analysis_data <- function(exposure, outcome, df, confounders) {
+  vars <- unique(c(exposure, outcome, confounders))
+  df %>%
+    select(all_of(vars)) %>%
+    filter(!is.na(.data[[exposure]]), !is.na(.data[[outcome]]))
+}
+
+data_itt_28 <- make_analysis_data("vent_label_ITT", "28-day mortality", data_imputed, confounders)
+data_itt_discharge <- make_analysis_data("vent_label_ITT", "hospital_expire_flag", data_imputed, confounders)
+data_pp_28 <- make_analysis_data("vent_label_PP", "28-day mortality", data_imputed, confounders)
+data_pp_discharge <- make_analysis_data("vent_label_PP", "hospital_expire_flag", data_imputed, confounders)
+data_sen_28 <- make_analysis_data("vent_label_sen", "28-day mortality", data_imputed, confounders)
+data_sen_discharge <- make_analysis_data("vent_label_sen", "hospital_expire_flag", data_imputed, confounders)
+
+```
+
+### PSM
+```{r,echo = FALSE}
+if (!requireNamespace("MatchIt", quietly = TRUE)) {
+  stop("Package 'MatchIt' is required. Please install it with install.packages('MatchIt').")
+}
+
+psm_inputs <- list(
+  itt_28 = list(data = data_itt_28, exposure = "vent_label_ITT", outcome = "28-day mortality"),
+  itt_discharge = list(data = data_itt_discharge, exposure = "vent_label_ITT", outcome = "hospital_expire_flag"),
+  pp_28 = list(data = data_pp_28, exposure = "vent_label_PP", outcome = "28-day mortality"),
+  pp_discharge = list(data = data_pp_discharge, exposure = "vent_label_PP", outcome = "hospital_expire_flag"),
+  sen_28 = list(data = data_sen_28, exposure = "vent_label_sen", outcome = "28-day mortality"),
+  sen_discharge = list(data = data_sen_discharge, exposure = "vent_label_sen", outcome = "hospital_expire_flag")
+)
+
+is_binary01 <- function(x) {
+  vals <- unique(x[!is.na(x)])
+  length(vals) == 2 && all(sort(as.numeric(vals)) %in% c(0, 1))
+}
+
+to_binary01 <- function(x) {
+  if (is.logical(x)) return(as.integer(x))
+  if (is.numeric(x)) return(as.numeric(x))
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("FALSE", "False", "false", "No", "NO", "no")] <- "0"
+  x_chr[x_chr %in% c("TRUE", "True", "true", "Yes", "YES", "yes")] <- "1"
+  suppressWarnings(as.numeric(x_chr))
+}
+
+run_psm <- function(df, exposure, outcome, confounders, dataset_name) {
+  use_covariates <- intersect(confounders, names(df))
+  if (length(use_covariates) == 0) {
+    stop(paste("No confounders available for", dataset_name))
+  }
+
+  work <- df %>%
+    select(all_of(unique(c(exposure, outcome, use_covariates)))) %>%
+    filter(
+      !is.na(.data[[exposure]]),
+      !is.na(.data[[outcome]]),
+      if_all(all_of(use_covariates), ~ !is.na(.x))
+    )
+
+  if (nrow(work) == 0) {
+    stop(paste("No valid rows after filtering for", dataset_name))
+  }
+
+  work <- work %>%
+    mutate(
+      .exposure = to_binary01(.data[[exposure]]),
+      .outcome = to_binary01(.data[[outcome]])
+    )
+
+  if (!is_binary01(work$.exposure)) {
+    stop(paste("Exposure must be binary 0/1 in", dataset_name))
+  }
+
+  match_formula <- as.formula(
+    paste(".exposure ~", paste(use_covariates, collapse = " + "))
+  )
+
+  match_fit <- MatchIt::matchit(
+    formula = match_formula,
+    data = work,
+    method = "nearest",
+    distance = "glm",
+    ratio = 1,
+    replace = FALSE
+  )
+
+  matched_data <- MatchIt::match.data(match_fit)
+  outcome_is_binary <- is_binary01(matched_data$.outcome)
+
+  if (outcome_is_binary) {
+    outcome_model <- glm(.outcome ~ .exposure, data = matched_data, family = binomial(), weights = weights)
+    model_out <- broom::tidy(outcome_model, conf.int = TRUE, exponentiate = TRUE)
+    effect_row <- model_out %>%
+      filter(term == ".exposure") %>%
+      transmute(
+        dataset = dataset_name,
+        exposure = exposure,
+        outcome = outcome,
+        measure = "OR",
+        estimate = estimate,
+        conf.low = conf.low,
+        conf.high = conf.high,
+        p.value = p.value
+      )
+  } else {
+    outcome_model <- lm(.outcome ~ .exposure, data = matched_data, weights = weights)
+    model_out <- broom::tidy(outcome_model, conf.int = TRUE)
+    effect_row <- model_out %>%
+      filter(term == ".exposure") %>%
+      transmute(
+        dataset = dataset_name,
+        exposure = exposure,
+        outcome = outcome,
+        measure = "Beta",
+        estimate = estimate,
+        conf.low = conf.low,
+        conf.high = conf.high,
+        p.value = p.value
+      )
+  }
+
+  summary_row <- tibble(
+    dataset = dataset_name,
+    exposure = exposure,
+    outcome = outcome,
+    n_before = nrow(work),
+    n_after = nrow(matched_data),
+    treated_after = sum(matched_data$.exposure == 1, na.rm = TRUE),
+    control_after = sum(matched_data$.exposure == 0, na.rm = TRUE)
+  )
+
+  list(
+    match_fit = match_fit,
+    matched_data = matched_data,
+    outcome_model = outcome_model,
+    model_output = model_out,
+    effect_row = effect_row,
+    summary_row = summary_row
+  )
+}
+
+psm_runs <- lapply(
+  names(psm_inputs),
+  function(nm) {
+    x <- psm_inputs[[nm]]
+    run_psm(
+      df = x$data,
+      exposure = x$exposure,
+      outcome = x$outcome,
+      confounders = confounders,
+      dataset_name = nm
+    )
+  }
+)
+names(psm_runs) <- names(psm_inputs)
+
+## Saved outputs
+psm_match_models <- lapply(psm_runs, `[[`, "match_fit")
+psm_matched_datasets <- lapply(psm_runs, `[[`, "matched_data")
+psm_outcome_models <- lapply(psm_runs, `[[`, "outcome_model")
+
+## Tables
+psm_results_table <- bind_rows(lapply(psm_runs, `[[`, "summary_row"))
+psm_model_output_table <- bind_rows(lapply(psm_runs, `[[`, "effect_row")) %>%
+  mutate(
+    result_id = paste0(exposure, " | ", outcome)
+  )
+
+psm_results_table
+psm_model_output_table
+
+## One forest plot for all treatment effects
+plot_data <- psm_model_output_table %>%
+  filter(measure == "OR") %>%
+  left_join(
+    psm_results_table %>% select(dataset, n_before, n_after),
+    by = "dataset"
+  ) %>%
+  mutate(
+    result_label = paste0(result_id, " (n=", n_before, "→", n_after, ")"),
+    result_label = factor(result_label, levels = rev(unique(result_label)))
+  )
+
+ggplot(
+  plot_data,
+  aes(y = result_label, x = estimate, xmin = conf.low, xmax = conf.high, color = exposure)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_errorbarh(height = 0.16, linewidth = 0.9) +
+  geom_point(size = 2.8) +
+  labs(
+    x = "Odds ratio (matched sample)",
+    y = NULL,
+    color = "Exposure",
+    title = "PSM Treatment Effects Across All Exposure-Outcome Datasets"
+  ) +
+  theme_minimal(base_size = 12)
+
+
+```
+
+
+
+### Doubly Robust IPW
+
+```{r,echo=FALSE}
+dr_inputs <- list(
+  itt_28 = list(data = data_itt_28, exposure = "vent_label_ITT", outcome = "28-day mortality"),
+  itt_discharge = list(data = data_itt_discharge, exposure = "vent_label_ITT", outcome = "hospital_expire_flag"),
+  pp_28 = list(data = data_pp_28, exposure = "vent_label_PP", outcome = "28-day mortality"),
+  pp_discharge = list(data = data_pp_discharge, exposure = "vent_label_PP", outcome = "hospital_expire_flag"),
+  sen_28 = list(data = data_sen_28, exposure = "vent_label_sen", outcome = "28-day mortality"),
+  sen_discharge = list(data = data_sen_discharge, exposure = "vent_label_sen", outcome = "hospital_expire_flag")
+)
+
+is_binary01 <- function(x) {
+  vals <- unique(x[!is.na(x)])
+  length(vals) == 2 && all(sort(as.numeric(vals)) %in% c(0, 1))
+}
+
+to_binary01 <- function(x) {
+  if (is.logical(x)) return(as.integer(x))
+  if (is.numeric(x)) return(as.numeric(x))
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("FALSE", "False", "false", "No", "NO", "no")] <- "0"
+  x_chr[x_chr %in% c("TRUE", "True", "true", "Yes", "YES", "yes")] <- "1"
+  suppressWarnings(as.numeric(x_chr))
+}
+
+run_dr_ipw <- function(df, exposure, outcome, confounders, dataset_name) {
+  use_covariates <- intersect(confounders, names(df))
+  if (length(use_covariates) == 0) {
+    stop(paste("No confounders available for", dataset_name))
+  }
+
+  work <- df %>%
+    select(all_of(unique(c(exposure, outcome, use_covariates)))) %>%
+    filter(
+      !is.na(.data[[exposure]]),
+      !is.na(.data[[outcome]]),
+      if_all(all_of(use_covariates), ~ !is.na(.x))
+    ) %>%
+    mutate(
+      .exposure = to_binary01(.data[[exposure]]),
+      .outcome = to_binary01(.data[[outcome]])
+    ) %>%
+    filter(!is.na(.exposure), !is.na(.outcome))
+
+  if (!is_binary01(work$.exposure)) {
+    stop(paste("Exposure must be binary 0/1 in", dataset_name))
+  }
+  if (!is_binary01(work$.outcome)) {
+    stop(paste("Outcome must be binary 0/1 in", dataset_name))
+  }
+
+  ps_formula <- as.formula(
+    paste(".exposure ~", paste(use_covariates, collapse = " + "))
+  )
+  ps_model <- glm(ps_formula, data = work, family = binomial())
+
+  work <- work %>%
+    mutate(
+      ps = predict(ps_model, type = "response"),
+      ps = pmin(pmax(ps, 0.01), 0.99)
+    )
+
+  p_treated <- mean(work$.exposure == 1)
+  work <- work %>%
+    mutate(
+      sw = if_else(
+        .exposure == 1,
+        p_treated / ps,
+        (1 - p_treated) / (1 - ps)
+      ),
+      sw = pmin(sw, 10)
+    )
+
+  dr_formula <- as.formula(
+    paste(".outcome ~ .exposure +", paste(use_covariates, collapse = " + "))
+  )
+  dr_model <- glm(
+    dr_formula,
+    data = work,
+    family = binomial(),
+    weights = sw
+  )
+
+  effect_row <- broom::tidy(dr_model, conf.int = TRUE, exponentiate = TRUE) %>%
+    filter(term == ".exposure") %>%
+    transmute(
+      dataset = dataset_name,
+      exposure = exposure,
+      outcome = outcome,
+      measure = "OR",
+      estimate = estimate,
+      conf.low = conf.low,
+      conf.high = conf.high,
+      p.value = p.value
+    )
+
+  summary_row <- tibble(
+    dataset = dataset_name,
+    exposure = exposure,
+    outcome = outcome,
+    mean_weight = mean(work$sw, na.rm = TRUE),
+    max_weight = max(work$sw, na.rm = TRUE)
+  )
+
+  list(
+    analysis_data = work,
+    ps_model = ps_model,
+    dr_model = dr_model,
+    effect_row = effect_row,
+    summary_row = summary_row
+  )
+}
+
+dr_runs <- lapply(
+  names(dr_inputs),
+  function(nm) {
+    x <- dr_inputs[[nm]]
+    run_dr_ipw(
+      df = x$data,
+      exposure = x$exposure,
+      outcome = x$outcome,
+      confounders = confounders,
+      dataset_name = nm
+    )
+  }
+)
+names(dr_runs) <- names(dr_inputs)
+
+## Saved outputs
+dr_analysis_datasets <- lapply(dr_runs, `[[`, "analysis_data")
+dr_ps_models <- lapply(dr_runs, `[[`, "ps_model")
+dr_outcome_models <- lapply(dr_runs, `[[`, "dr_model")
+
+## Tables
+dr_results_table <- bind_rows(lapply(dr_runs, `[[`, "summary_row"))
+dr_model_output_table <- bind_rows(lapply(dr_runs, `[[`, "effect_row")) %>%
+  mutate(
+    result_label = paste0(exposure, " | ", outcome),
+    result_label = factor(result_label, levels = rev(unique(result_label)))
+  )
+
+dr_results_table
+dr_model_output_table
+
+## Forest plot for all six treatment effects
+ggplot(
+  dr_model_output_table,
+  aes(y = result_label, x = estimate, xmin = conf.low, xmax = conf.high, color = exposure)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_errorbarh(height = 0.16, linewidth = 0.9) +
+  geom_point(size = 2.8) +
+  labs(
+    x = "Odds ratio (doubly robust IPW)",
+    y = NULL,
+    color = "Exposure",
+    title = "Doubly Robust IPW Treatment Effects Across All Exposure-Outcome Datasets"
+  ) +
+  theme_minimal(base_size = 12)
+
+## Build six dataset-level diagnostic plots (PS distribution + weight distribution)
+make_ps_weight_plot <- function(df, title_txt) {
+  p_ps <- ggplot(df, aes(x = ps, color = factor(.exposure), fill = factor(.exposure))) +
+    geom_density(alpha = 0.2, linewidth = 0.9) +
+    labs(
+      x = "Propensity score",
+      y = "Density",
+      color = "Exposure",
+      fill = "Exposure",
+      title = paste0(title_txt, ": PS Distribution")
+    ) +
+    scale_color_manual(values = c("0" = "#4C78A8", "1" = "#E15759"), labels = c("0" = "0", "1" = "1")) +
+    scale_fill_manual(values = c("0" = "#4C78A8", "1" = "#E15759"), labels = c("0" = "0", "1" = "1")) +
+    theme_minimal(base_size = 10)
+
+  p_wt <- ggplot(df, aes(x = sw, fill = factor(.exposure))) +
+    geom_histogram(bins = 40, alpha = 0.6, position = "identity") +
+    labs(
+      x = "Stabilized weight",
+      y = "Count",
+      fill = "Exposure",
+      title = paste0(title_txt, ": Weight Distribution")
+    ) +
+    scale_fill_manual(values = c("0" = "#4C78A8", "1" = "#E15759"), labels = c("0" = "0", "1" = "1")) +
+    theme_minimal(base_size = 10)
+
+  p_ps + p_wt + patchwork::plot_layout(ncol = 2)
+}
+
+diag_plots <- lapply(
+  names(dr_analysis_datasets),
+  function(nm) make_ps_weight_plot(dr_analysis_datasets[[nm]], nm)
+)
+
+names(diag_plots) <- names(dr_analysis_datasets)
+dr_diagnostic_plots <- diag_plots
+
+for (nm in names(dr_diagnostic_plots)) {
+  print(dr_diagnostic_plots[[nm]])
+}
+
+```
+
+### temp
+```{r temp, echo=FALSE}
+if (!exists("psm_matched_datasets")) {
+  stop("`psm_matched_datasets` not found. Run the PSM chunk first.")
+}
+if (!exists("dr_analysis_datasets")) {
+  stop("`dr_analysis_datasets` not found. Run the Doubly Robust IPW chunk first.")
+}
+
+## Outcome distribution in matched samples (PSM)
+psm_outcome_distribution <- bind_rows(
+  lapply(names(psm_matched_datasets), function(nm) {
+    psm_matched_datasets[[nm]] %>%
+      count(.exposure, .outcome, name = "n") %>%
+      mutate(
+        dataset = nm,
+        method = "PSM",
+        pct = n / sum(n)
+      )
+  })
+) %>%
+  select(method, dataset, .exposure, .outcome, n, pct)
+
+## Outcome distribution in DR-IPW analysis data (raw + weighted)
+ipw_outcome_distribution <- bind_rows(
+  lapply(names(dr_analysis_datasets), function(nm) {
+    raw_tbl <- dr_analysis_datasets[[nm]] %>%
+      count(.exposure, .outcome, name = "n") %>%
+      mutate(
+        dataset = nm,
+        method = "DR-IPW_raw",
+        weighted_n = NA_real_,
+        pct = n / sum(n),
+        weighted_pct = NA_real_
+      )
+
+    wt_tbl <- dr_analysis_datasets[[nm]] %>%
+      group_by(.exposure, .outcome) %>%
+      summarise(weighted_n = sum(sw, na.rm = TRUE), .groups = "drop") %>%
+      mutate(
+        dataset = nm,
+        method = "DR-IPW_weighted",
+        n = NA_real_,
+        pct = NA_real_,
+        weighted_pct = weighted_n / sum(weighted_n)
+      )
+
+    bind_rows(raw_tbl, wt_tbl)
+  })
+) %>%
+  select(method, dataset, .exposure, .outcome, n, weighted_n, pct, weighted_pct)
+
+psm_outcome_distribution
+ipw_outcome_distribution
+```
+
+### check
+```{r check, echo=FALSE}
+check_inputs <- list(
+  itt_28 = list(data = data_itt_28, exposure = "vent_label_ITT", outcome = "28-day mortality"),
+  itt_discharge = list(data = data_itt_discharge, exposure = "vent_label_ITT", outcome = "hospital_expire_flag"),
+  pp_28 = list(data = data_pp_28, exposure = "vent_label_PP", outcome = "28-day mortality"),
+  pp_discharge = list(data = data_pp_discharge, exposure = "vent_label_PP", outcome = "hospital_expire_flag"),
+  sen_28 = list(data = data_sen_28, exposure = "vent_label_sen", outcome = "28-day mortality"),
+  sen_discharge = list(data = data_sen_discharge, exposure = "vent_label_sen", outcome = "hospital_expire_flag")
+)
+
+to_binary01_check <- function(x) {
+  if (is.logical(x)) return(as.integer(x))
+  if (is.numeric(x)) return(as.numeric(x))
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("FALSE", "False", "false", "No", "NO", "no")] <- "0"
+  x_chr[x_chr %in% c("TRUE", "True", "true", "Yes", "YES", "yes")] <- "1"
+  suppressWarnings(as.numeric(x_chr))
+}
+
+check_one_var <- function(df, var_name, dataset_name, role) {
+  raw <- df[[var_name]]
+  conv <- to_binary01_check(raw)
+
+  raw_non_missing_n <- sum(!is.na(raw))
+  conv_na_from_non_missing <- sum(!is.na(raw) & is.na(conv))
+  conv_non01_n <- sum(!is.na(conv) & !(conv %in% c(0, 1)))
+
+  raw_levels <- paste(sort(unique(as.character(raw[!is.na(raw)]))), collapse = ", ")
+  converted_levels <- paste(sort(unique(as.character(conv[!is.na(conv)]))), collapse = ", ")
+
+  tibble(
+    dataset = dataset_name,
+    role = role,
+    variable = var_name,
+    raw_non_missing_n = raw_non_missing_n,
+    converted_na_from_non_missing_n = conv_na_from_non_missing,
+    converted_non01_n = conv_non01_n,
+    risk_flag = conv_na_from_non_missing > 0 | conv_non01_n > 0,
+    raw_levels = raw_levels,
+    converted_levels = converted_levels
+  )
+}
+
+recoding_risk_check <- bind_rows(
+  lapply(names(check_inputs), function(nm) {
+    x <- check_inputs[[nm]]
+    bind_rows(
+      check_one_var(x$data, x$exposure, nm, "exposure"),
+      check_one_var(x$data, x$outcome, nm, "outcome")
+    )
+  })
+)
+
+recoding_risk_check
+```

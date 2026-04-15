@@ -39,7 +39,7 @@ mimic_iv_job <- bq_project_query(
   use_legacy_sql = FALSE
 )
 
-cancer_cohort <- bq_table_download(mimic_iv_job)
+cancer_vent_cohort <- bq_table_download(mimic_iv_job)
 ```
 
 
@@ -127,7 +127,7 @@ bq_data <- bq_project_query(project_id, query = sql)
 mimic_icu = bq_table_download(bq_data)
 
 mimic_icu = left_join(mimic_icu,mimic_demographic)
-mimic_first_icu = mimic_icu%>%filter(stay_id%in%first_icu$stay_id)
+mimic_first_icu = mimic_icu%>%filter(stay_id%in%first_icu$stay_id)###
 
 # 5. Cancer patients
 
@@ -140,7 +140,7 @@ mimic_cancer = bq_table_download(bq_data)
 mimic_cancer = mimic_cancer%>%filter(has_cancer == 1)
 
 first_icu_cancer = left_join(mimic_cancer,mimic_first_icu)
-first_icu_cancer = first_icu_cancer%>%filter(!is.na(stay_id))
+first_icu_cancer = first_icu_cancer%>%filter(!is.na(stay_id))### 6028
 
 # 6. Cancer patients
 
@@ -152,6 +152,9 @@ mimic_cancer = bq_table_download(bq_data)
 
 mimic_cancer = mimic_cancer%>%filter(has_cancer == 1)
 mimic_cancer_cohort = mimic_first_icu%>%filter(hadm_id%in%mimic_cancer$hadm_id)
+
+cancer_vent_cohort = cancer_vent_cohort%>%filter(stay_id%in%mimic_cancer_cohort$stay_id)
+mimic_cancer_cohort = left_join(mimic_cancer_cohort,cancer_vent_cohort)
 ```
 
 ### Adding Covariates
@@ -185,9 +188,183 @@ blood_gas = bq_table_download(bq_data)
 blood_gas = blood_gas%>%
   filter(hadm_id%in%mimic_cancer_cohort$hadm_id)
 
-mimic_cancer_cohort = left_join(mimic_cancer_cohort,cohort)
-```
+sql <- "SELECT * FROM `mimic-hr.derived.vitalsign` "
+bq_data <- bq_project_query(project_id, query = sql)
+vital = bq_table_download(bq_data)
+vital = vital%>%
+  filter(stay_id%in%mimic_cancer_cohort$stay_id)
+resp = vital%>%
+  select(stay_id, resp_rate, spo2, any_of(c("charttime", "storetime", "event_time", "endtime", "starttime", "hr")))
 
+
+```
+### Temp
+```{r,echo = False}
+preferred_time_cols <- c("charttime", "storetime", "event_time", "endtime", "starttime")
+resp_time_cols <- intersect(preferred_time_cols, names(resp))
+regex_time_cols <- names(resp)[str_detect(names(resp), "(?i)time|date")]
+resp_time_cols <- unique(c(resp_time_cols, regex_time_cols))
+has_hr <- "hr" %in% names(resp)
+safe_min <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) {
+    NA_real_
+  } else {
+    min(x)
+  }
+}
+
+resp_clean <- {
+  if (length(resp_time_cols) > 0) {
+    resp %>%
+      mutate(
+        across(all_of(resp_time_cols), ~ as.POSIXct(.x, tz = "UTC")),
+        resp_rate = suppressWarnings(as.numeric(resp_rate)),
+        spo2 = suppressWarnings(as.numeric(spo2)),
+        resp_time = coalesce(!!!syms(resp_time_cols))
+      ) %>%
+      filter(!is.na(resp_time))
+  } else if (has_hr) {
+    resp %>%
+      mutate(
+        hr = suppressWarnings(as.numeric(hr)),
+        resp_rate = suppressWarnings(as.numeric(resp_rate)),
+        spo2 = suppressWarnings(as.numeric(spo2))
+      )
+  } else {
+    warning("No timestamp/hr column found in resp; using all resp rows without pre/post-ICU time filtering.")
+    resp %>%
+      mutate(
+        resp_rate = suppressWarnings(as.numeric(resp_rate)),
+        spo2 = suppressWarnings(as.numeric(spo2))
+      )
+  }
+}
+
+resp_min_by_window <- mimic_cancer_cohort %>%
+  select(stay_id, intime, starttime) %>%
+  mutate(
+    intime = as.POSIXct(intime, tz = "UTC"),
+    starttime = as.POSIXct(starttime, tz = "UTC"),
+    preicu_cutoff = case_when(
+      !is.na(intime) & !is.na(starttime) ~ pmin(intime, starttime),
+      !is.na(intime) ~ intime,
+      !is.na(starttime) ~ starttime,
+      TRUE ~ as.POSIXct(NA_real_, origin = "1970-01-01", tz = "UTC")
+    )
+  ) %>%
+  left_join(resp_clean, by = "stay_id") %>%
+  {
+    if (length(resp_time_cols) > 0) {
+      mutate(
+        .,
+        is_preicu = !is.na(preicu_cutoff) & !is.na(resp_time) & resp_time <= preicu_cutoff,
+        is_day1_icu = !is.na(intime) & !is.na(resp_time) &
+          resp_time >= intime & resp_time <= (intime + lubridate::hours(24))
+      )
+    } else if (has_hr) {
+      mutate(
+        .,
+        is_preicu = !is.na(hr) & hr <= 0,
+        is_day1_icu = !is.na(hr) & hr >= 0 & hr <= 24
+      )
+    } else {
+      mutate(
+        .,
+        is_preicu = TRUE,
+        is_day1_icu = TRUE
+      )
+    }
+  } %>%
+  group_by(stay_id) %>%
+  summarise(
+    min_resp_rate_preicu = safe_min(resp_rate[is_preicu]),
+    min_spo2_preicu = safe_min(spo2[is_preicu]),
+    min_resp_rate_day1icu = safe_min(resp_rate[is_day1_icu]),
+    min_spo2_day1icu = safe_min(spo2[is_day1_icu]),
+    .groups = "drop"
+  )
+
+n_before_resp_join <- nrow(mimic_cancer_cohort)
+mimic_cancer_cohort <- mimic_cancer_cohort %>%
+  left_join(resp_min_by_window, by = "stay_id")
+stopifnot(nrow(mimic_cancer_cohort) == n_before_resp_join)
+
+## Lowest blood gas so2 and pao2/fio2 ratio before ICU admission
+bg_join_key <- intersect(c("stay_id", "hadm_id", "subject_id"), names(blood_gas))
+bg_join_key <- bg_join_key[bg_join_key %in% names(mimic_cancer_cohort)][1]
+
+if (!is.na(bg_join_key) && length(bg_join_key) > 0) {
+  bg_time_cols <- intersect(c("charttime", "storetime", "event_time", "endtime", "starttime"), names(blood_gas))
+  bg_time_cols <- unique(c(bg_time_cols, names(blood_gas)[str_detect(names(blood_gas), "(?i)time|date")]))
+
+  bg_preicu_min <- mimic_cancer_cohort %>%
+    select(stay_id, all_of(bg_join_key), intime, starttime) %>%
+    distinct() %>%
+    mutate(
+      intime = as.POSIXct(intime, tz = "UTC"),
+      starttime = as.POSIXct(starttime, tz = "UTC"),
+      preicu_cutoff = case_when(
+        !is.na(intime) & !is.na(starttime) ~ pmin(intime, starttime),
+        !is.na(intime) ~ intime,
+        !is.na(starttime) ~ starttime,
+        TRUE ~ as.POSIXct(NA_real_, origin = "1970-01-01", tz = "UTC")
+      )
+    ) %>%
+    left_join(
+      {
+        bg_tmp <- blood_gas %>%
+          mutate(
+            so2_num = suppressWarnings(as.numeric(so2)),
+            pao2fio2ratio_num = case_when(
+              "pao2fio2ratio" %in% names(blood_gas) ~ suppressWarnings(as.numeric(.data[["pao2fio2ratio"]])),
+              all(c("po2", "fio2") %in% names(blood_gas)) ~ {
+                po2_num <- suppressWarnings(as.numeric(.data[["po2"]]))
+                fio2_num <- suppressWarnings(as.numeric(.data[["fio2"]]))
+                fio2_frac <- if_else(fio2_num > 1, fio2_num / 100, fio2_num)
+                po2_num / fio2_frac
+              },
+              TRUE ~ NA_real_
+            )
+          )
+
+        if (length(bg_time_cols) > 0) {
+          bg_tmp %>%
+            mutate(
+              across(all_of(bg_time_cols), ~ as.POSIXct(.x, tz = "UTC")),
+              bg_time = coalesce(!!!syms(bg_time_cols))
+            ) %>%
+            filter(!is.na(bg_time))
+        } else {
+          warning("No timestamp column found in blood_gas; using all rows without pre-ICU time filtering.")
+          bg_tmp
+        }
+      },
+      by = bg_join_key
+    ) %>%
+    {
+      if (length(bg_time_cols) > 0) {
+        filter(., !is.na(preicu_cutoff), bg_time <= preicu_cutoff)
+      } else {
+        .
+      }
+    } %>%
+    group_by(stay_id) %>%
+    summarise(
+      min_so2_preicu = safe_min(so2_num),
+      min_pao2fio2ratio_preicu = safe_min(pao2fio2ratio_num),
+      .groups = "drop"
+    )
+
+  n_before_bg_join <- nrow(mimic_cancer_cohort)
+  mimic_cancer_cohort <- mimic_cancer_cohort %>%
+    left_join(bg_preicu_min, by = "stay_id")
+  stopifnot(nrow(mimic_cancer_cohort) == n_before_bg_join)
+} else {
+  warning("No common join key found between mimic_cancer_cohort and blood_gas (stay_id/hadm_id/subject_id).")
+}
+
+```
 
 ### Selection Criteria
 
@@ -213,9 +390,21 @@ cohort <- mimic_cancer_cohort %>%
   )
 
 ### Exclude arrive at ICU ventilated 1 hours before arrive
-cohort = cohort%>%filter(time_diff_hours>-1&time_diff_hours<24)### 1512 ### Define require ventilated patient as immediately ventilated and ventilated slightly before ICU admission and also ventilated very soon. 
+cohort = cohort %>%
+  filter(
+    time_diff_hours > -1 & time_diff_hours < 24 |
+      (
+        coalesce(min_resp_rate_preicu > 30, FALSE) |
+          coalesce(min_spo2_preicu < 90, FALSE) |
+          coalesce(min_so2_preicu < 90, FALSE) |
+          coalesce(min_pao2fio2ratio_preicu < 150, FALSE)
+      )
+  ) ### Define require ventilated patient as immediately ventilated and ventilated slightly before ICU admission and also ventilated very soon.
 
 cohort = left_join(cohort,mimic_cancer%>%select(hadm_id,group_solid,group_hematological,group_metastasized))
+cohort = cohort %>%
+  arrange(stay_id, intime) %>%
+  distinct(stay_id, .keep_all = TRUE)
 ```
 
 ### Add Covariests
@@ -228,16 +417,24 @@ cohort = left_join(cohort,mimic_cancer%>%select(hadm_id,group_solid,group_hemato
 resp_support_col <- c("ventilation_status")
 
 if (!is.na(resp_support_col)) {
+  has_niv_inv <- "NIV_INV" %in% names(cohort)
   cohort <- cohort %>%
     mutate(
-      vent_label = case_when(
+      vent_label_ITT = case_when(
+        .data[[resp_support_col]] %in% c("HFNC", "NonInvasiveVent") ~ 0L,
+        .data[[resp_support_col]] %in% c("Tracheostomy", "InvasiveVent") ~ 1L
+      ),
+      vent_label_PP = case_when(
+        .data[[resp_support_col]] %in% c("Tracheostomy", "InvasiveVent") ~ 1L,
+        NIV_IMV == 1 ~ 1L,
+        .data[[resp_support_col]] %in% c("HFNC", "NonInvasiveVent") ~ 0L
+      ),
+      vent_label_sen = case_when(
         .data[[resp_support_col]] %in% c("HFNC", "NonInvasiveVent") ~ 0L,
         .data[[resp_support_col]] %in% c("Tracheostomy", "InvasiveVent") ~ 1L,
-        TRUE ~ NA_integer_
+        is.na(.data[[resp_support_col]]) ~ 0L
       )
-    ) %>%
-    filter(.data[[resp_support_col]] != "None") %>%
-    filter(!is.na(vent_label))
+    )
 }
 
 ## Add SOFA-related covariates from first 6 ICU hours (max value, ignore NA)
@@ -262,7 +459,7 @@ agg_by_name <- function(x, var_name) {
 }
 
 sofa6_max <- sofa2_cohort %>%
-  filter(hr <= 6) %>%
+  filter(hr <= 24) %>%
   group_by(stay_id) %>%
   summarise(
     across(
@@ -311,11 +508,7 @@ if (length(available_pressor_vars) > 0) {
 
 ### Other
 ```{r,echo = F}
-sql <- "SELECT * FROM `physionet-data.mimiciv_3_1_derived.bg` 
-where specimen = 'ART.'
-"
-bq_data <- bq_project_query(project_id, query = sql)
-blood_gas = bq_table_download(bq_data)
+
 
 bg_vars <- c(
   "so2", "po2", "pco2", "fio2", "bicarbonate", "totalco2",
@@ -371,7 +564,9 @@ fwrite(cohort, file = "sph5104gp.csv")
 
 ### Table 1
 ```{r,echo = F}
-table1_data <- cohort %>%
+table1_data = cohort%>%filter(!is.na(ventilation_status))
+
+table1_data <- table1_data %>%
   mutate(
     race_group = case_when(
       str_detect(str_to_upper(coalesce(race, "")), "^WHITE") ~ "WHITE",
@@ -388,8 +583,8 @@ table1_data <- cohort %>%
       str_to_upper(coalesce(insurance, "")) == "PRIVATE" ~ "Private",
       TRUE ~ "Other"
     ),
-    vent_label = factor(
-      vent_label,
+    vent_label_ITT = factor(
+      vent_label_ITT,
       levels = c(0, 1),
       labels = c("HFNC/NonInvasiveVent", "Tracheostomy/InvasiveVent")
     ),
@@ -402,15 +597,16 @@ table1_data <- cohort %>%
     language_group = factor(language_group, levels = c("English", "Non-English")),
     insurance_group = factor(insurance_group, levels = c("Medicare/Medicaid", "Private", "Other"))
   ) %>%
-  filter(!is.na(vent_label))
+  filter(!is.na(vent_label_ITT))
 
 vars_1a_req <- c(
   "28-day mortality", "hospital_expire_flag", "age", "sofa_24hours", "sapsii",
-  "race_group", "language_group", "insurance_group", "marital_status"
+  "race_group", "language_group", "insurance_group"
 )
 vars_1b_req <- c(
   "meanbp_min", "gcs_min", "bilirubin_max", "creatinine_max", "platelet_min",
-  "dialysis_active", "ph", "bicarbonate", "potassium",
+  "dialysis_active", "ph", "bicarbonate", "potassium","min_spo2_preicu","min_resp_rate_preicu","min_so2_preicu","min_pao2fio2ratio_preicu",
+  
   "so2", "po2", "pco2", "fio2", "totalco2", "hematocrit", "hemoglobin",
   "carboxyhemoglobin", "methemoglobin", "chloride", "calcium",
   "temperature", "sodium", "lactate", "glucose", "sapsii", "pressor"
@@ -425,8 +621,8 @@ make_table1_formula <- function(vars, strata) {
   as.formula(paste("~", paste(sprintf("`%s`", vars), collapse = " + "), "|", strata))
 }
 
-tab_1a <- table1::table1(make_table1_formula(vars_1a, "vent_label"), data = table1_data)
-tab_1b <- table1::table1(make_table1_formula(vars_1b, "vent_label"), data = table1_data)
+tab_1a <- table1::table1(make_table1_formula(vars_1a, "vent_label_ITT"), data = table1_data)
+tab_1b <- table1::table1(make_table1_formula(vars_1b, "vent_label_ITT"), data = table1_data)
 
 cat("Table 1a\n")
 tab_1a
