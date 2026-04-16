@@ -22,6 +22,11 @@ library(patchwork)
 library(writexl)
 
 library(MatchIt)
+
+# Reference switch for exposure coding used across all models:
+# TRUE  -> NIV is reference (NIV=0, INV=1)
+# FALSE -> INV is reference (INV=0, NIV=1)
+niv_reference <- FALSE
 ```
 
 ### Pre-processing
@@ -41,7 +46,7 @@ cohort <- fread("sph5104gp.csv")
 # )
 
 confounders <- c(
-  "age", "meanbp_min", "gcs_min",
+  "insurance_group","age", "group_solid","group_hematological","group_metastasized""meanbp_min", "gcs_min",
   "bilirubin_max", "creatinine_max", "platelet_min",
   "dialysis_active", "ph", "bicarbonate", "potassium",
   "temperature", "sodium", "glucose", "pressor"
@@ -50,6 +55,29 @@ confounders <- c(
 required_vars <- c("vent_label_ITT","vent_label_PP","vent_label_sen", confounders, "hospital_expire_flag", "28-day mortality")
 
 data <- cohort %>% select(any_of(required_vars))
+
+exposure_vars <- c("vent_label_ITT", "vent_label_PP", "vent_label_sen")
+outcome_vars <- c("28-day mortality", "hospital_expire_flag")
+
+data <- data %>%
+  mutate(
+    across(
+      any_of(exposure_vars),
+      ~ case_when(
+        as.character(.) == "1" ~ "INV",
+        as.character(.) == "0" ~ "NIV",
+        TRUE ~ as.character(.)
+      )
+    ),
+    across(
+      any_of(outcome_vars),
+      ~ case_when(
+        as.character(.) == "1" ~ "death",
+        as.character(.) == "0" ~ "alive",
+        TRUE ~ as.character(.)
+      )
+    )
+  )
 
 
 ```
@@ -158,6 +186,15 @@ to_binary01 <- function(x) {
   x_chr <- trimws(as.character(x))
   x_chr[x_chr %in% c("FALSE", "False", "false", "No", "NO", "no")] <- "0"
   x_chr[x_chr %in% c("TRUE", "True", "true", "Yes", "YES", "yes")] <- "1"
+  if (isTRUE(niv_reference)) {
+    x_chr[x_chr %in% c("NIV", "niv")] <- "0"
+    x_chr[x_chr %in% c("INV", "inv")] <- "1"
+  } else {
+    x_chr[x_chr %in% c("INV", "inv")] <- "0"
+    x_chr[x_chr %in% c("NIV", "niv")] <- "1"
+  }
+  x_chr[x_chr %in% c("alive", "Alive")] <- "0"
+  x_chr[x_chr %in% c("death", "Death")] <- "1"
   suppressWarnings(as.numeric(x_chr))
 }
 
@@ -207,14 +244,25 @@ run_psm <- function(df, exposure, outcome, confounders, dataset_name) {
 
   if (outcome_is_binary) {
     outcome_model <- glm(.outcome ~ .exposure, data = matched_data, family = binomial(), weights = weights)
-    model_out <- broom::tidy(outcome_model, conf.int = TRUE, exponentiate = TRUE)
+    model_out <- broom::tidy(outcome_model, conf.int = TRUE, exponentiate = FALSE)
+    model_out_or <- broom::tidy(outcome_model, conf.int = TRUE, exponentiate = TRUE)
     effect_row <- model_out %>%
       filter(term == ".exposure") %>%
+      left_join(
+        model_out_or %>%
+          filter(term == ".exposure") %>%
+          transmute(term, OR = estimate, OR_conf.low = conf.low, OR_conf.high = conf.high),
+        by = "term"
+      ) %>%
       transmute(
         dataset = dataset_name,
         exposure = exposure,
         outcome = outcome,
         measure = "OR",
+        outcome_coef = estimate,
+        OR = OR,
+        OR_conf.low = OR_conf.low,
+        OR_conf.high = OR_conf.high,
         estimate = estimate,
         conf.low = conf.low,
         conf.high = conf.high,
@@ -230,6 +278,10 @@ run_psm <- function(df, exposure, outcome, confounders, dataset_name) {
         exposure = exposure,
         outcome = outcome,
         measure = "Beta",
+        outcome_coef = estimate,
+        OR = NA_real_,
+        OR_conf.low = NA_real_,
+        OR_conf.high = NA_real_,
         estimate = estimate,
         conf.low = conf.low,
         conf.high = conf.high,
@@ -299,9 +351,9 @@ plot_data <- psm_model_output_table %>%
     result_label = factor(result_label, levels = rev(unique(result_label)))
   )
 
-ggplot(
+psm_forest_plot <- ggplot(
   plot_data,
-  aes(y = result_label, x = estimate, xmin = conf.low, xmax = conf.high, color = exposure)
+  aes(y = result_label, x = OR, xmin = OR_conf.low, xmax = OR_conf.high, color = exposure)
 ) +
   geom_vline(xintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.6) +
   geom_errorbarh(height = 0.16, linewidth = 0.9) +
@@ -313,6 +365,18 @@ ggplot(
     title = "PSM Treatment Effects Across All Exposure-Outcome Datasets"
   ) +
   theme_minimal(base_size = 12)
+
+ggsave(
+  filename = "psm_forest_plot.png",
+  plot = psm_forest_plot,
+  width = 12,
+  height = 8,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+psm_forest_plot
 
 
 ```
@@ -342,6 +406,15 @@ to_binary01 <- function(x) {
   x_chr <- trimws(as.character(x))
   x_chr[x_chr %in% c("FALSE", "False", "false", "No", "NO", "no")] <- "0"
   x_chr[x_chr %in% c("TRUE", "True", "true", "Yes", "YES", "yes")] <- "1"
+  if (isTRUE(niv_reference)) {
+    x_chr[x_chr %in% c("NIV", "niv")] <- "0"
+    x_chr[x_chr %in% c("INV", "inv")] <- "1"
+  } else {
+    x_chr[x_chr %in% c("INV", "inv")] <- "0"
+    x_chr[x_chr %in% c("NIV", "niv")] <- "1"
+  }
+  x_chr[x_chr %in% c("alive", "Alive")] <- "0"
+  x_chr[x_chr %in% c("death", "Death")] <- "1"
   suppressWarnings(as.numeric(x_chr))
 }
 
@@ -403,13 +476,26 @@ run_dr_ipw <- function(df, exposure, outcome, confounders, dataset_name) {
     weights = sw
   )
 
-  effect_row <- broom::tidy(dr_model, conf.int = TRUE, exponentiate = TRUE) %>%
+  dr_model_coef <- broom::tidy(dr_model, conf.int = TRUE, exponentiate = FALSE)
+  dr_model_or <- broom::tidy(dr_model, conf.int = TRUE, exponentiate = TRUE)
+
+  effect_row <- dr_model_coef %>%
     filter(term == ".exposure") %>%
+    left_join(
+      dr_model_or %>%
+        filter(term == ".exposure") %>%
+        transmute(term, OR = estimate, OR_conf.low = conf.low, OR_conf.high = conf.high),
+      by = "term"
+    ) %>%
     transmute(
       dataset = dataset_name,
       exposure = exposure,
       outcome = outcome,
       measure = "OR",
+      outcome_coef = estimate,
+      OR = OR,
+      OR_conf.low = OR_conf.low,
+      OR_conf.high = OR_conf.high,
       estimate = estimate,
       conf.low = conf.low,
       conf.high = conf.high,
@@ -465,9 +551,9 @@ dr_results_table
 dr_model_output_table
 
 ## Forest plot for all six treatment effects
-ggplot(
+dr_forest_plot <- ggplot(
   dr_model_output_table,
-  aes(y = result_label, x = estimate, xmin = conf.low, xmax = conf.high, color = exposure)
+  aes(y = result_label, x = OR, xmin = OR_conf.low, xmax = OR_conf.high, color = exposure)
 ) +
   geom_vline(xintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.6) +
   geom_errorbarh(height = 0.16, linewidth = 0.9) +
@@ -479,6 +565,18 @@ ggplot(
     title = "Doubly Robust IPW Treatment Effects Across All Exposure-Outcome Datasets"
   ) +
   theme_minimal(base_size = 12)
+
+ggsave(
+  filename = "dr_ipw_forest_plot.png",
+  plot = dr_forest_plot,
+  width = 12,
+  height = 8,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+dr_forest_plot
 
 ## Build six dataset-level diagnostic plots (PS distribution + weight distribution)
 make_ps_weight_plot <- function(df, title_txt) {
@@ -521,6 +619,155 @@ for (nm in names(dr_diagnostic_plots)) {
   print(dr_diagnostic_plots[[nm]])
 }
 
+```
+
+### Logistic Regression
+```{r logistic_regression, echo=FALSE}
+logit_inputs <- list(
+  itt_28 = list(data = data_itt_28, exposure = "vent_label_ITT", outcome = "28-day mortality"),
+  itt_discharge = list(data = data_itt_discharge, exposure = "vent_label_ITT", outcome = "hospital_expire_flag"),
+  pp_28 = list(data = data_pp_28, exposure = "vent_label_PP", outcome = "28-day mortality"),
+  pp_discharge = list(data = data_pp_discharge, exposure = "vent_label_PP", outcome = "hospital_expire_flag"),
+  sen_28 = list(data = data_sen_28, exposure = "vent_label_sen", outcome = "28-day mortality"),
+  sen_discharge = list(data = data_sen_discharge, exposure = "vent_label_sen", outcome = "hospital_expire_flag")
+)
+
+to_binary01_logit <- function(x) {
+  if (is.logical(x)) return(as.integer(x))
+  if (is.numeric(x)) return(as.numeric(x))
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("FALSE", "False", "false", "No", "NO", "no")] <- "0"
+  x_chr[x_chr %in% c("TRUE", "True", "true", "Yes", "YES", "yes")] <- "1"
+  if (isTRUE(niv_reference)) {
+    x_chr[x_chr %in% c("NIV", "niv")] <- "0"
+    x_chr[x_chr %in% c("INV", "inv")] <- "1"
+  } else {
+    x_chr[x_chr %in% c("INV", "inv")] <- "0"
+    x_chr[x_chr %in% c("NIV", "niv")] <- "1"
+  }
+  x_chr[x_chr %in% c("alive", "Alive")] <- "0"
+  x_chr[x_chr %in% c("death", "Death")] <- "1"
+  suppressWarnings(as.numeric(x_chr))
+}
+
+is_binary01_logit <- function(x) {
+  vals <- unique(x[!is.na(x)])
+  length(vals) == 2 && all(sort(as.numeric(vals)) %in% c(0, 1))
+}
+
+run_logit <- function(df, exposure, outcome, confounders, dataset_name) {
+  use_covariates <- intersect(confounders, names(df))
+  if (length(use_covariates) == 0) {
+    stop(paste("No confounders available for", dataset_name))
+  }
+
+  work <- df %>%
+    select(all_of(unique(c(exposure, outcome, use_covariates)))) %>%
+    filter(
+      !is.na(.data[[exposure]]),
+      !is.na(.data[[outcome]]),
+      if_all(all_of(use_covariates), ~ !is.na(.x))
+    ) %>%
+    mutate(
+      .exposure = to_binary01_logit(.data[[exposure]]),
+      .outcome = to_binary01_logit(.data[[outcome]])
+    ) %>%
+    filter(!is.na(.exposure), !is.na(.outcome))
+
+  if (!is_binary01_logit(work$.exposure)) {
+    stop(paste("Exposure must be binary 0/1 in", dataset_name))
+  }
+  if (!is_binary01_logit(work$.outcome)) {
+    stop(paste("Outcome must be binary 0/1 in", dataset_name))
+  }
+
+  model_formula <- as.formula(
+    paste(".outcome ~ .exposure +", paste(use_covariates, collapse = " + "))
+  )
+  fit <- glm(model_formula, data = work, family = binomial())
+
+  coef_tbl <- broom::tidy(fit, conf.int = TRUE, exponentiate = FALSE)
+  or_tbl <- broom::tidy(fit, conf.int = TRUE, exponentiate = TRUE)
+
+  effect_row <- coef_tbl %>%
+    filter(term == ".exposure") %>%
+    left_join(
+      or_tbl %>%
+        filter(term == ".exposure") %>%
+        transmute(term, OR = estimate, OR_conf.low = conf.low, OR_conf.high = conf.high),
+      by = "term"
+    ) %>%
+    transmute(
+      dataset = dataset_name,
+      exposure = exposure,
+      outcome = outcome,
+      n = nrow(work),
+      outcome_coef = estimate,
+      coef_conf.low = conf.low,
+      coef_conf.high = conf.high,
+      OR = OR,
+      OR_conf.low = OR_conf.low,
+      OR_conf.high = OR_conf.high,
+      p.value = p.value
+    )
+
+  list(
+    model = fit,
+    model_output = coef_tbl,
+    effect_row = effect_row
+  )
+}
+
+logit_runs <- lapply(
+  names(logit_inputs),
+  function(nm) {
+    x <- logit_inputs[[nm]]
+    run_logit(
+      df = x$data,
+      exposure = x$exposure,
+      outcome = x$outcome,
+      confounders = confounders,
+      dataset_name = nm
+    )
+  }
+)
+names(logit_runs) <- names(logit_inputs)
+
+logit_models <- lapply(logit_runs, `[[`, "model")
+logit_results_table <- bind_rows(lapply(logit_runs, `[[`, "effect_row")) %>%
+  mutate(
+    result_label = paste0(exposure, " | ", outcome),
+    result_label = factor(result_label, levels = rev(unique(result_label)))
+  )
+
+logit_results_table
+
+logit_forest_plot <- ggplot(
+  logit_results_table,
+  aes(y = result_label, x = OR, xmin = OR_conf.low, xmax = OR_conf.high, color = exposure)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_errorbarh(height = 0.16, linewidth = 0.9) +
+  geom_point(size = 2.8) +
+  labs(
+    x = "Odds ratio (logistic regression)",
+    y = NULL,
+    color = "Exposure",
+    title = "Logistic Regression Treatment Effects Across All Exposure-Outcome Datasets"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(
+  filename = "logistic_regression_forest_plot.png",
+  plot = logit_forest_plot,
+  width = 12,
+  height = 8,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+logit_forest_plot
 ```
 
 ### temp
@@ -596,6 +843,15 @@ to_binary01_check <- function(x) {
   x_chr <- trimws(as.character(x))
   x_chr[x_chr %in% c("FALSE", "False", "false", "No", "NO", "no")] <- "0"
   x_chr[x_chr %in% c("TRUE", "True", "true", "Yes", "YES", "yes")] <- "1"
+  if (isTRUE(niv_reference)) {
+    x_chr[x_chr %in% c("NIV", "niv")] <- "0"
+    x_chr[x_chr %in% c("INV", "inv")] <- "1"
+  } else {
+    x_chr[x_chr %in% c("INV", "inv")] <- "0"
+    x_chr[x_chr %in% c("NIV", "niv")] <- "1"
+  }
+  x_chr[x_chr %in% c("alive", "Alive")] <- "0"
+  x_chr[x_chr %in% c("death", "Death")] <- "1"
   suppressWarnings(as.numeric(x_chr))
 }
 

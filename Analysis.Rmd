@@ -601,7 +601,7 @@ table1_data <- table1_data %>%
 
 vars_1a_req <- c(
   "28-day mortality", "hospital_expire_flag", "age", "sofa_24hours", "sapsii",
-  "race_group", "language_group", "insurance_group"
+  "race_group", "language_group", "insurance_group","group_solid","group_hematological","group_metastasized"
 )
 vars_1b_req <- c(
   "meanbp_min", "gcs_min", "bilirubin_max", "creatinine_max", "platelet_min",
