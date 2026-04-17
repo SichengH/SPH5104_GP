@@ -564,7 +564,9 @@ fwrite(cohort, file = "sph5104gp.csv")
 
 ### Table 1
 ```{r,echo = F}
+
 table1_data = cohort%>%filter(!is.na(ventilation_status))
+
 
 table1_data <- table1_data %>%
   mutate(

@@ -362,9 +362,16 @@ psm_forest_plot <- ggplot(
     x = "Odds ratio (matched sample)",
     y = NULL,
     color = "Exposure",
-    title = "PSM Treatment Effects Across All Exposure-Outcome Datasets"
+    title = "PSM ATT Across All Exposure-Outcome"
   ) +
-  theme_minimal(base_size = 12)
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title.x = element_text(size = 15),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 14)
+  )
 
 ggsave(
   filename = "psm_forest_plot.png",
@@ -562,9 +569,16 @@ dr_forest_plot <- ggplot(
     x = "Odds ratio (doubly robust IPW)",
     y = NULL,
     color = "Exposure",
-    title = "Doubly Robust IPW Treatment Effects Across All Exposure-Outcome Datasets"
+    title = "DR-IPW ATE Across All Exposure-Outcome"
   ) +
-  theme_minimal(base_size = 12)
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title.x = element_text(size = 15),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 14)
+  )
 
 ggsave(
   filename = "dr_ipw_forest_plot.png",
